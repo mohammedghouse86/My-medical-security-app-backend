@@ -71,9 +71,8 @@ function apiKeyGate(req, res, next) {
 // terminates TLS at its edge, so in that environment there is at least one hop.
 // Measured from production logs, not guessed: a real request arrives as
 // <caller> <- <Cloudflare edge> <- <Render proxy> <- 127.0.0.1, so three hops
-// in front of this app are ours. The allow list below depends on this being
-// right - at 1 the derived caller is Render's own proxy and a short, spoofed
-// X-Forwarded-For would satisfy the list.
+// in front of this app are ours. This only affects which address the inbound
+// log attributes a request to; it no longer gates access.
 const TRUSTED_PROXY_HOPS = Number.parseInt(process.env.TRUSTED_PROXY_HOPS || '3', 10);
 // Node reports IPv4 peers on a dual-stack socket as ::ffff:a.b.c.d.
 const normalizeIp = ip => String(ip || '').replace(/^::ffff:/i, '').trim();
@@ -125,59 +124,10 @@ app.use((req, res, next) => {
   next();
 });
 
-// --- Allowed source IPs (allow list) ----------------------------------------
-// The API is closed by default: every request is refused unless the caller's
-// address is on this list. Seeded below and extended at deploy time through a
-// comma-separated ALLOWED_IPS environment variable, so access can be granted or
-// withdrawn without a code change. Registered ahead of the API key gate, so a
-// caller that is not on the list never reaches authentication or patient data.
-//
-// This is the inverse of a block list, and the difference matters: a block list
-// that fails to identify the caller lets them through, while an allow list that
-// fails to identify them must refuse. So it fails closed.
-//
-// Only the two fields we treat as the caller are matched: the hop-derived
-// callerIP, and the one a fronting CDN names outright. X-Forwarded-For entries
-// further left are the caller's own claim and are never matched - honouring
-// them would let anyone write themselves onto the list.
-//
-// callerIP counts only when the hop chain is long enough for TRUSTED_PROXY_HOPS
-// to mean something. On a short chain describeCaller falls back to the leftmost
-// X-Forwarded-For entry, which is precisely the value a caller controls, so an
-// untrustworthy chain is refused rather than guessed at.
-//
-// Standing caveat: cf-connecting-ip is only meaningful because traffic reaches
-// this app through Cloudflare. Anyone who can talk to the Render origin directly
-// can invent that header, so this list is only as strong as that assumption.
-const ALLOWED_IPS = new Set([
-  // The addresses permitted to reach the API.
-  '51.81.125.179',
-  '40.160.10.27',
-  '40.160.98.145',
-  '40.160.98.227',
-  '10.40.20.159',
-  '52.42.150.13',
-  '183.83.39.17',
-  ...String(process.env.ALLOWED_IPS || '').split(',').map(normalizeIp).filter(Boolean)
-]);
-
-app.use((req, res, next) => {
-  const c = req.caller;
-  const candidates = [];
-  if (c.trustworthy) candidates.push(c.callerIP);
-  if (c.cdnReportedIP) candidates.push(c.cdnReportedIP);
-  if (candidates.some(ip => ALLOWED_IPS.has(ip))) return next();
-  const parts = [
-    `[blocked] ${req.method} ${req.originalUrl}`,
-    `IP ${c.cdnReportedIP || c.callerIP} tried to access the app and was refused: not on the allow list`,
-    `caller IP: ${c.callerIP}`
-  ];
-  if (c.cdnReportedIP) parts.push(`Cloudflare says: ${c.cdnReportedIP}`);
-  parts.push(`hops: ${c.hopChain.length > 1 ? c.hopChain.join(' <- ') : 'direct, no X-Forwarded-For'}`);
-  if (!c.trustworthy) parts.push('WARNING: chain shorter than TRUSTED_PROXY_HOPS, caller unidentifiable, refused');
-  console.warn(parts.join(' | '));
-  res.status(403).json({ error: 'Forbidden' });
-});
+// IP allow list removed: the API no longer refuses callers by source address.
+// Inbound IP logging above still records each caller, but every request is now
+// allowed through to authentication. Access is governed by the API key gate and
+// per-endpoint auth only.
 
 app.use(apiKeyGate);
 
