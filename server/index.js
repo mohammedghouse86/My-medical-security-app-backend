@@ -258,7 +258,8 @@ app.get('/api/auth/me',auth,(req,res)=>{
 // Simulates one tenant's saved login dying mid-scan, so PerfAI can be tested
 // against a login that can neither be used nor renewed for a window. NOT in the
 // public docs. Off unless TEST_HOOK_SECRET is set (otherwise 404). Guarded by
-// an X-Test-Hook-Secret header. Only Tenant-B (HOSP1002) accounts are allowed.
+// an X-Test-Hook-Secret header. Allowed for Tenant-A (HOSP1001) and Tenant-B
+// (HOSP1002) accounts.
 // Effect: sets the user's token cutoff to now (kills existing tokens) and swaps
 // the password to an unknown random value for a window, then restores the
 // original password exactly once via a timer. The cutoff is left in place, so
@@ -266,7 +267,7 @@ app.get('/api/auth/me',auth,(req,res)=>{
 const TEST_HOOK_SECRET = process.env.TEST_HOOK_SECRET || '';
 // Restore window in minutes. Default 20; override (e.g. a small value) for tests.
 const TEST_HOOK_RESTORE_MINUTES = Number.parseFloat(process.env.TEST_HOOK_RESTORE_MINUTES || '20');
-const TEST_HOOK_TENANT = 'HOSP1002'; // Tenant-B
+const TEST_HOOK_TENANTS = new Set(['HOSP1001', 'HOSP1002']); // Tenant-A and Tenant-B
 // Tracks an in-flight password change so a repeat call never re-saves the
 // already-changed password nor schedules a second restore. username -> state.
 const pwRestore = new Map();
@@ -276,7 +277,7 @@ app.post('/api/test-hooks/kill-session',(req,res)=>{
   if(req.headers['x-test-hook-secret']!==TEST_HOOK_SECRET) return res.status(401).json({error:'Unauthorized'});
   const username=req.body&&req.body.username;
   const d=read(); const u=username&&d.users.find(x=>x.username===username);
-  if(!u||u.tenantId!==TEST_HOOK_TENANT) return res.status(400).json({error:'username must be a Tenant-B account'});
+  if(!u||!TEST_HOOK_TENANTS.has(u.tenantId)) return res.status(400).json({error:'username must be a Tenant-A or Tenant-B account'});
 
   // Kill all existing tokens for this user.
   sessionCutoffs.set(username, Date.now());
