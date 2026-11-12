@@ -32,7 +32,9 @@ const apiKeyForUsername = username => Buffer.from(String(username), 'utf8').toSt
 // Sign-in issues the key, so it cannot require one. Swagger UI and the raw spec
 // are plain browser assets - the page cannot attach a header to its own
 // bootstrap request - so the docs stay open too.
-const API_KEY_EXEMPT = new Set(['/api/signin', '/api/docs', '/api/openapi.yaml']);
+// '/api/test-hooks/kill-session' is a hidden, test-only endpoint guarded by its
+// own secret header (see below). It carries no API key, so it is exempt here.
+const API_KEY_EXEMPT = new Set(['/api/signin', '/api/docs', '/api/openapi.yaml', '/api/test-hooks/kill-session']);
 
 // Buffer's base64 decoder silently drops invalid characters, so re-encode the
 // result and compare: that is what actually rejects a non-base64 header.
@@ -206,6 +208,13 @@ function makeToken(user) {
   return `${header}.${payload}.${sign(`${header}.${payload}`)}`;
 }
 
+// --- Test-only session kill (see POST /api/test-hooks/kill-session) ----------
+// Per-user cutoff: a token whose iat (issue time) is at or before the user's
+// cutoff is treated as dead. In-memory only, never persisted, keyed by username.
+// Used to simulate a saved login dying mid-scan. Compared in milliseconds so a
+// token minted in the same wall-clock second as the cutoff is still killed.
+const sessionCutoffs = new Map(); // username -> cutoff epoch ms
+
 // INTENTIONAL (vuln): the token is HS256-signed when issued (so it has a real
 // third segment), but the signature is NOT verified here — the payload is
 // decoded and trusted after only an expiry check. A tampered payload (e.g.
@@ -218,6 +227,9 @@ function auth(req,res,next) {
     if(parts.length<2) throw new Error('bad token');
     const p=JSON.parse(Buffer.from(parts[1], 'base64url').toString());
     if(!p.exp || p.exp < Math.floor(Date.now()/1000)) return res.status(401).json({error:'Token expired'});
+    // Test-only: reject tokens issued before this user's cutoff (killed session).
+    const cutoff = sessionCutoffs.get(p.username);
+    if(cutoff && typeof p.iat==='number' && p.iat*1000 < cutoff) return res.status(401).json({error:'Token expired'});
     req.user=p;
     next();
   } catch(e) { return res.status(401).json({error:'Invalid token'}); }
@@ -240,6 +252,55 @@ app.post('/api/signin',(req,res)=>{
 app.get('/api/auth/me',auth,(req,res)=>{
   const d=read(); const u=find(d.users,req.user.userId);
   res.json({user:u?{id:u.id,username:u.username,name:u.name,role:u.role,tenantId:u.tenantId}:req.user});
+});
+
+// --- Hidden, test-only session-kill hook ------------------------------------
+// Simulates one tenant's saved login dying mid-scan, so PerfAI can be tested
+// against a login that can neither be used nor renewed for a window. NOT in the
+// public docs. Off unless TEST_HOOK_SECRET is set (otherwise 404). Guarded by
+// an X-Test-Hook-Secret header. Only Tenant-B (HOSP1002) accounts are allowed.
+// Effect: sets the user's token cutoff to now (kills existing tokens) and swaps
+// the password to an unknown random value for a window, then restores the
+// original password exactly once via a timer. The cutoff is left in place, so
+// the pre-kill tokens stay dead even after the password is restored.
+const TEST_HOOK_SECRET = process.env.TEST_HOOK_SECRET || '';
+// Restore window in minutes. Default 20; override (e.g. a small value) for tests.
+const TEST_HOOK_RESTORE_MINUTES = Number.parseFloat(process.env.TEST_HOOK_RESTORE_MINUTES || '20');
+const TEST_HOOK_TENANT = 'HOSP1002'; // Tenant-B
+// Tracks an in-flight password change so a repeat call never re-saves the
+// already-changed password nor schedules a second restore. username -> state.
+const pwRestore = new Map();
+
+app.post('/api/test-hooks/kill-session',(req,res)=>{
+  if(!TEST_HOOK_SECRET) return res.status(404).json({error:'Not found'});
+  if(req.headers['x-test-hook-secret']!==TEST_HOOK_SECRET) return res.status(401).json({error:'Unauthorized'});
+  const username=req.body&&req.body.username;
+  const d=read(); const u=username&&d.users.find(x=>x.username===username);
+  if(!u||u.tenantId!==TEST_HOOK_TENANT) return res.status(400).json({error:'username must be a Tenant-B account'});
+
+  // Kill all existing tokens for this user.
+  sessionCutoffs.set(username, Date.now());
+
+  // Change the password for the window, restoring exactly once. On a repeat call
+  // while a change is already pending, keep the first-saved original (the source
+  // of truth) and the first timer untouched; do not overwrite with the already-
+  // changed value and do not schedule a second restore.
+  let state=pwRestore.get(username);
+  if(!state){
+    const original=u.password;                                  // the one place the original lives
+    u.password='killed-'+crypto.randomBytes(9).toString('hex'); // unknown value -> all sign-ins fail
+    const changedAt=Date.now();
+    const restoreAt=changedAt+TEST_HOOK_RESTORE_MINUTES*60*1000;
+    const timer=setTimeout(()=>{
+      const dd=read(); const uu=dd.users.find(x=>x.username===username);
+      if(uu) uu.password=original;                              // restore once
+      pwRestore.delete(username);
+    }, TEST_HOOK_RESTORE_MINUTES*60*1000);
+    if(timer.unref) timer.unref();                             // don't hold the process open
+    state={changedAt,restoreAt,timer};
+    pwRestore.set(username,state);
+  }
+  res.json({username, passwordChangedAt:new Date(state.changedAt).toISOString(), passwordRestoreAt:new Date(state.restoreAt).toISOString()});
 });
 
 app.get('/api/hospitals',auth,(req,res)=>{const d=read(); res.json(req.user.role==='admin'?d.hospitals:d.hospitals.filter(h=>h.id===req.user.tenantId));});
